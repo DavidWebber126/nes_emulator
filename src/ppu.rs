@@ -1,15 +1,22 @@
 use crate::cartridges::Mirroring;
-use crate::render;
+
+pub enum TickStatus {
+    SameScanline,
+    NewScanline,
+    NewFrame,
+}
 
 pub struct NesPPU {
     pub chr_rom: Vec<u8>,
     pub palette_table: [u8; 32],
     pub vram: [u8; 2048],
     pub mirroring: Mirroring,
-    scanline: u16,
-    cycles: usize,
+    pub scanline: usize,
+    pub cycles: usize,
+    pub current_frame_is_odd: bool,
 
     internal_data_buf: u8,
+    internal_nametable: u8,
     pub nmi_interrupt: Option<u8>,
 
     pub addr: AddrRegister,
@@ -31,8 +38,10 @@ impl NesPPU {
             palette_table: [0; 32],
             scanline: 0,
             cycles: 0,
+            current_frame_is_odd: false,
 
             internal_data_buf: 0,
+            internal_nametable: 0,
             nmi_interrupt: None,
 
             addr: AddrRegister::new(),
@@ -48,15 +57,31 @@ impl NesPPU {
 
     pub fn write_to_ppu_addr(&mut self, value: u8) {
         self.addr.update(value);
+        if !self.addr.hi_ptr {
+            self.internal_nametable = (self.addr.value.0 & 0b1100) >> 2;
+        }
+        // scroll and addr share w register
+        self.scroll.toggle_latch();
     }
 
     pub fn write_to_ctrl(&mut self, value: u8) {
         let before_nmi_status = self.ctrl.0 & 0b1000_0000;
         self.ctrl.update(value);
+        self.internal_nametable = value & 0b11;
         let in_vblank = self.status.0 & 0b1000_0000;
         let nmi_status = self.ctrl.0 & 0b1000_0000;
         if (!before_nmi_status & nmi_status & in_vblank) != 0 {
             self.nmi_interrupt = Some(1);
+        }
+    }
+
+    pub fn nametable_addr(&self) -> u16 {
+        match self.internal_nametable & 0b11 {
+            0 => 0x2000,
+            1 => 0x2400,
+            2 => 0x2800,
+            3 => 0x2C00,
+            _ => panic!("Impossible nametable"),
         }
     }
 
@@ -81,6 +106,26 @@ impl NesPPU {
             0x2000..=0x2fff => {
                 let result = self.internal_data_buf;
                 self.internal_data_buf = self.vram[self.mirror_vram_addr(addr) as usize];
+                result
+            }
+            0x3000..=0x3eff => panic!(
+                "addr space 0x3000..0x3eff is not expected to be used, requested = {} ",
+                addr
+            ),
+            0x3f00..=0x3fff => self.palette_table[(addr - 0x3f00) as usize],
+            _ => panic!("unexpected access to mirrored space {}", addr),
+        }
+    }
+
+    pub fn trace_read_data(&mut self) -> u8 {
+        let addr = self.addr.get();
+        match addr {
+            0..=0x1fff => {
+                let result = self.internal_data_buf;
+                result
+            }
+            0x2000..=0x2fff => {
+                let result = self.internal_data_buf;
                 result
             }
             0x3000..=0x3eff => panic!(
@@ -129,6 +174,8 @@ impl NesPPU {
 
     pub fn write_to_scroll(&mut self, data: u8) {
         self.scroll.write(data);
+        // scroll and addr share w register
+        self.addr.toggle_latch();
     }
 
     pub fn write_to_oam_addr(&mut self, data: u8) {
@@ -173,42 +220,33 @@ impl NesPPU {
         }
     }
 
-    pub fn tick(&mut self, cycles: u8) -> bool {
+    pub fn tick(&mut self, cycles: u8) -> TickStatus {
         self.cycles += cycles as usize;
-        if self.cycles >= 341 {
-            if self.is_sprite_0_hit(self.cycles) {
-                self.status.0 |= 0b0100_0000;
-            }
-
-            self.cycles -= 341;
+        if self.cycles >= 340 {
+            self.cycles = 0;
             self.scanline += 1;
 
             match self.scanline {
-                1..=240 | 242..=261 => {}
-                241 => {
+                1..=240 => return TickStatus::NewScanline,
+                242 => {
                     self.status.0 |= 0b1000_0000;
-                    self.status.0 &= 0b1011_1111;
+                    //self.status.0 &= 0b1011_1111;
                     if self.ctrl.0 & 0b1000_0000 != 0 {
                         self.nmi_interrupt = Some(1);
-                    } 
+                    }
                 }
+                241 | 243..=261 => {}
                 262 => {
                     self.scanline = 0;
-                    self.status.0 &= 0b0111_1111;
-                    self.status.0 &= 0b1011_1111;
+                    self.status.0 &= 0b0011_1111;
                     self.nmi_interrupt = None;
-                    return true;
+                    self.current_frame_is_odd = !self.current_frame_is_odd;
+                    return TickStatus::NewFrame;
                 }
-                _ => panic!("Scanline {} is supposed to be unreachable", self.scanline)
+                _ => panic!("Scanline {} is supposed to be unreachable", self.scanline),
             }
         }
-        false
-    }
-
-    fn is_sprite_0_hit(&self, cycle: usize) -> bool {
-        let y = self.oam_data[0] as usize;
-        let x = self.oam_data[3] as usize;
-        (y == self.scanline as usize) && x <= cycle && (self.mask.0 & 0b00001000 != 0)
+        TickStatus::SameScanline
     }
 }
 
@@ -262,6 +300,10 @@ impl AddrRegister {
     pub fn get(&self) -> u16 {
         ((self.value.0 as u16) << 8) | (self.value.1 as u16)
     }
+
+    fn toggle_latch(&mut self) {
+        self.hi_ptr = !self.hi_ptr;
+    }
 }
 
 impl Default for AddrRegister {
@@ -286,7 +328,7 @@ impl Default for AddrRegister {
 // |          (0: read backdrop from EXT pins; 1: output color on EXT pins)
 // +--------- Generate an NMI at the start of the
 //            vertical blanking interval (0: off; 1: on)
-pub struct ControlRegister(u8);
+pub struct ControlRegister(pub u8);
 
 impl ControlRegister {
     pub fn new() -> Self {
@@ -350,7 +392,7 @@ impl Default for ControlRegister {
 // ||+------- Emphasize red (green on PAL/Dendy)
 // |+-------- Emphasize green (red on PAL/Dendy)
 // +--------- Emphasize blue
-pub struct MaskRegister(u8);
+pub struct MaskRegister(pub u8);
 
 impl MaskRegister {
     pub fn new() -> Self {
@@ -359,6 +401,14 @@ impl MaskRegister {
 
     pub fn update(&mut self, data: u8) {
         self.0 = data;
+    }
+
+    pub fn render_background(&self) -> bool {
+        self.0 & 0b1000 != 0
+    }
+
+    pub fn render_sprites(&self) -> bool {
+        self.0 & 0b1_0000 != 0
     }
 }
 
@@ -388,7 +438,7 @@ impl Default for MaskRegister {
 //            line); cleared after reading $2002 and at dot 1 of the
 //            pre-render line.
 
-pub struct StatusRegister(u8);
+pub struct StatusRegister(pub u8);
 
 impl StatusRegister {
     pub fn new() -> Self {
@@ -438,6 +488,10 @@ impl ScrollRegister {
 
     pub fn scroll_y(&self) -> u8 {
         self.value.1
+    }
+
+    fn toggle_latch(&mut self) {
+        self.x_ptr = !self.x_ptr;
     }
 }
 

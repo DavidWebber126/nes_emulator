@@ -47,6 +47,15 @@ impl Joypad {
         response
     }
 
+    // Returns same as above but without side effects
+    pub fn trace_read(&mut self) -> u8 {
+        if self.button_index > 7 {
+            return 1;
+        }
+        let response = (self.button_status.0 & (1 << self.button_index)) >> self.button_index;
+        response
+    }
+
     pub fn set_button_pressed_status(&mut self, button: &JoypadButton, pressed: bool) {
         if pressed {
             self.button_status.0 |= button.0

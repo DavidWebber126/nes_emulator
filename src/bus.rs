@@ -1,4 +1,9 @@
-use crate::{cartridges::Rom, joypad::Joypad, ppu::NesPPU};
+use crate::{
+    cartridges::Rom,
+    joypad::Joypad,
+    ppu::{NesPPU, TickStatus},
+    {render, render::Frame},
+};
 
 const RAM: u16 = 0x0000;
 const RAM_MIRRORS_END: u16 = 0x1FFF;
@@ -21,19 +26,20 @@ pub trait Mem {
 }
 
 pub struct Bus<'call> {
-    cpu_vram: [u8; 2048],
-    rom: Vec<u8>,
-    ppu: NesPPU,
+    pub cpu_vram: [u8; 2048],
+    pub rom: Vec<u8>,
+    pub ppu: NesPPU,
+    frame: Frame,
     joypad1: Joypad,
 
     cycles: usize,
-    gameloop_callback: Box<dyn FnMut(&NesPPU, &mut Joypad) + 'call>,
+    gameloop_callback: Box<dyn FnMut(&mut Frame, &mut Joypad) + 'call>,
 }
 
 impl<'a> Bus<'a> {
     pub fn new<'call, F>(rom: Rom, gameloop_callback: F) -> Bus<'call>
     where
-        F: FnMut(&NesPPU, &mut Joypad) + 'call,
+        F: FnMut(&mut Frame, &mut Joypad) + 'call,
     {
         let ppu = NesPPU::new(rom.chr_rom, rom.screen_mirroring);
 
@@ -41,6 +47,7 @@ impl<'a> Bus<'a> {
             cpu_vram: [0; 2048],
             rom: rom.prg_rom,
             ppu,
+            frame: Frame::new(),
             joypad1: Joypad::new(),
             cycles: 0,
             gameloop_callback: Box::from(gameloop_callback),
@@ -54,9 +61,16 @@ impl<'a> Bus<'a> {
     pub fn tick(&mut self, cycles: u8) {
         self.cycles += cycles as usize;
 
-        let new_frame = self.ppu.tick(cycles * 3);
-        if new_frame {
-            (self.gameloop_callback)(&self.ppu, &mut self.joypad1);
+        let render_status = self.ppu.tick(cycles * 3);
+        match render_status {
+            TickStatus::NewFrame => {
+                //render::render_sprites(&self.ppu, &mut self.frame);
+                (self.gameloop_callback)(&mut self.frame, &mut self.joypad1);
+            }
+            TickStatus::NewScanline => {
+                render::render_visible_scanline(&mut self.ppu, &mut self.frame);
+            }
+            TickStatus::SameScanline => {}
         }
     }
 
@@ -67,6 +81,34 @@ impl<'a> Bus<'a> {
             addr %= 0x4000;
         }
         self.rom[addr as usize]
+    }
+
+    // These are functions that read address locations without side effects
+    pub fn trace_mem_read(&mut self, addr: u16) -> u8 {
+        match addr {
+            RAM..=RAM_MIRRORS_END => {
+                let mirror_down_addr = addr & 0b0000_0111_1111_1111;
+                self.cpu_vram[mirror_down_addr as usize]
+            }
+            0x2000 | 0x2001 | 0x2003 | 0x2005 | 0x2006 | 0x4014 => {
+                //panic!("Attempt to read from write-only PPU address {:x}", addr);
+                0
+            }
+            0x2002 => self.ppu.status.0,
+            0x2004 => self.ppu.read_from_oam_data(),
+            0x2007 => self.ppu.trace_read_data(),
+            0x2008..=PPU_REGISTERS_MIRRORS_END => {
+                let mirror_down_addr = addr & 0b00100000_00000111;
+                self.mem_read(mirror_down_addr)
+            }
+            0x4016 => self.joypad1.trace_read(),
+            0x4017 => 0,
+            0x8000..=0xFFFF => self.read_prg_rom(addr),
+            _ => {
+                println!("Ignoring mem access at {:04X}", addr);
+                0
+            }
+        }
     }
 }
 
@@ -104,7 +146,10 @@ impl Mem for Bus<'_> {
                 let mirror_down_addr = addr & 0b0000_0111_1111_1111;
                 self.cpu_vram[mirror_down_addr as usize] = data;
             }
-            0x2000 => self.ppu.write_to_ctrl(data),
+            0x2000 => {
+                //println!("Write to ctrl: {:08b}, PPU Status: {:08b}, PPU Scanline: {}", data, self.ppu.read_status(), self.ppu.scanline);
+                self.ppu.write_to_ctrl(data)
+            },
             0x2001 => self.ppu.write_to_mask(data),
             0x2002 => panic!("attempt to write to PPU status register"),
             0x2003 => self.ppu.write_to_oam_addr(data),

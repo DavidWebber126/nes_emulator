@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bus::Bus;
-use ppu::NesPPU;
+//use ppu::NesPPU;
 use render::Frame;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
@@ -15,8 +15,10 @@ pub mod opcodes;
 pub mod ppu;
 pub mod render;
 pub mod snake;
+pub mod trace;
 use cartridges::Rom;
 use cpu::CPU;
+use trace::trace;
 
 fn main() {
     // init sdl2
@@ -48,42 +50,41 @@ fn main() {
     key_map.insert(Keycode::S, joypad::JoypadButton::new(0b0000_0010));
 
     //load the game
-    let bytes: Vec<u8> = std::fs::read("roms/Super Mario Bros.nes").unwrap();
+    let bytes: Vec<u8> = std::fs::read("roms/nestest.nes").unwrap();
     let rom = Rom::new(&bytes).unwrap();
 
-    let mut frame = Frame::new();
-
-    let bus = Bus::new(rom, move |ppu: &NesPPU, joypad: &mut joypad::Joypad| {
-        render::render(ppu, &mut frame);
-        texture.update(None, &frame.data, 256 * 3).unwrap();
-
-        canvas.copy(&texture, None, None).unwrap();
-        canvas.present();
-        for event in event_pump.poll_iter() {
-            match event {
-                Event::Quit { .. }
-                | Event::KeyDown {
-                    keycode: Some(Keycode::Escape),
-                    ..
-                } => std::process::exit(0),
-                Event::KeyDown { keycode, .. } => {
-                    if let Some(key) = key_map.get(&keycode.unwrap_or(Keycode::Ampersand)) {
-                        joypad.set_button_pressed_status(key, true);
+    let bus = Bus::new(
+        rom,
+        move |frame: &mut Frame, joypad: &mut joypad::Joypad| {
+            texture.update(None, &frame.data, 256 * 3).unwrap();
+            canvas.copy(&texture, None, None).unwrap();
+            canvas.present();
+            for event in event_pump.poll_iter() {
+                match event {
+                    Event::Quit { .. }
+                    | Event::KeyDown {
+                        keycode: Some(Keycode::Escape),
+                        ..
+                    } => std::process::exit(0),
+                    Event::KeyDown { keycode, .. } => {
+                        if let Some(key) = key_map.get(&keycode.unwrap_or(Keycode::Ampersand)) {
+                            joypad.set_button_pressed_status(key, true);
+                        }
                     }
-                }
-                Event::KeyUp { keycode, .. } => {
-                    if let Some(key) = key_map.get(&keycode.unwrap_or(Keycode::Ampersand)) {
-                        joypad.set_button_pressed_status(key, false);
+                    Event::KeyUp { keycode, .. } => {
+                        if let Some(key) = key_map.get(&keycode.unwrap_or(Keycode::Ampersand)) {
+                            joypad.set_button_pressed_status(key, false);
+                        }
                     }
+                    _ => { /* do nothing */ }
                 }
-                _ => { /* do nothing */ }
             }
-        }
-    });
+        },
+    );
 
     let mut cpu = CPU::new(bus);
     cpu.reset();
     cpu.run_with_callback(move |_cpu| {
-        //println!("{}", cpu::trace(cpu));
+        //println!("{}", trace::trace(cpu));
     });
 }
