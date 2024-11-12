@@ -3,6 +3,7 @@ use crate::{
     joypad::Joypad,
     ppu::{NesPPU, TickStatus},
     {render, render::Frame},
+    apu::Apu,
 };
 
 const RAM: u16 = 0x0000;
@@ -29,27 +30,27 @@ pub struct Bus<'call> {
     pub cpu_vram: [u8; 2048],
     pub rom: Vec<u8>,
     pub ppu: NesPPU,
+    pub apu: Apu,
     frame: Frame,
     joypad1: Joypad,
 
-    cycles: usize,
-    gameloop_callback: Box<dyn FnMut(&mut Frame, &mut Joypad) + 'call>,
+    gameloop_callback: Box<dyn FnMut(&mut Frame, &mut Joypad, &mut Vec<f32>) + 'call>,
 }
 
 impl<'a> Bus<'a> {
     pub fn new<'call, F>(rom: Rom, gameloop_callback: F) -> Bus<'call>
     where
-        F: FnMut(&mut Frame, &mut Joypad) + 'call,
+        F: FnMut(&mut Frame, &mut Joypad, &mut Vec<f32>) + 'call,
     {
         let ppu = NesPPU::new(rom.chr_rom, rom.screen_mirroring);
 
         Bus {
             cpu_vram: [0; 2048],
-            rom: rom.prg_rom,
+            rom: rom.prg_rom.clone(),
             ppu,
+            apu: Apu::new(rom.prg_rom),
             frame: Frame::new(),
             joypad1: Joypad::new(),
-            cycles: 0,
             gameloop_callback: Box::from(gameloop_callback),
         }
     }
@@ -58,19 +59,25 @@ impl<'a> Bus<'a> {
         self.ppu.nmi_interrupt.take()
     }
 
-    pub fn tick(&mut self, cycles: u8) {
-        self.cycles += cycles as usize;
+    pub fn poll_irq_status(&mut self) -> Option<u8> {
+        if self.apu.status & 0b1100_0000 != 0 {
+            Some(1)
+        } else {
+            None
+        }
+    }
 
+    pub fn tick(&mut self, cycles: u8) {
+        self.apu.tick(cycles);
         let render_status = self.ppu.tick(cycles * 3);
         match render_status {
-            TickStatus::NewFrame => {
-                //render::render_sprites(&self.ppu, &mut self.frame);
-                (self.gameloop_callback)(&mut self.frame, &mut self.joypad1);
+            TickStatus::SameScanline => {}
+            TickStatus::NewFrame     => {
+                (self.gameloop_callback)(&mut self.frame, &mut self.joypad1, &mut self.apu.buffer);
             }
-            TickStatus::NewScanline => {
+            TickStatus::NewScanline  => {
                 render::render_visible_scanline(&mut self.ppu, &mut self.frame);
             }
-            TickStatus::SameScanline => {}
         }
     }
 
@@ -91,7 +98,6 @@ impl<'a> Bus<'a> {
                 self.cpu_vram[mirror_down_addr as usize]
             }
             0x2000 | 0x2001 | 0x2003 | 0x2005 | 0x2006 | 0x4014 => {
-                //panic!("Attempt to read from write-only PPU address {:x}", addr);
                 0
             }
             0x2002 => self.ppu.status.0,
@@ -120,7 +126,6 @@ impl Mem for Bus<'_> {
                 self.cpu_vram[mirror_down_addr as usize]
             }
             0x2000 | 0x2001 | 0x2003 | 0x2005 | 0x2006 | 0x4014 => {
-                //panic!("Attempt to read from write-only PPU address {:x}", addr);
                 0
             }
             0x2002 => self.ppu.read_status(),
@@ -130,6 +135,7 @@ impl Mem for Bus<'_> {
                 let mirror_down_addr = addr & 0b00100000_00000111;
                 self.mem_read(mirror_down_addr)
             }
+            0x4015 => self.apu.read_status(),
             0x4016 => self.joypad1.read(),
             0x4017 => 0,
             0x8000..=0xFFFF => self.read_prg_rom(addr),
@@ -169,16 +175,39 @@ impl Mem for Bus<'_> {
                 }
                 self.ppu.write_oam_dma(&page_data);
             }
-            0x4000..=0x4013 | 0x4015 => {
-                //ignore APU
+            // APU Calls
+            0x4000 => self.apu.pulse1.write_to_envelope(data),
+            0x4001 => self.apu.pulse1.write_to_sweep(data),
+            0x4002 => self.apu.pulse1.write_to_timer_low(data),
+            0x4003 => self.apu.pulse1.write_to_timer_high(data),
+            0x4004 => self.apu.pulse2.write_to_envelope(data),
+            0x4005 => self.apu.pulse2.write_to_sweep(data),
+            0x4006 => self.apu.pulse2.write_to_timer_low(data),
+            0x4007 => self.apu.pulse2.write_to_timer_high(data),
+            0x4008 => self.apu.triangle.write_to_linear_counter(data),
+            0x400A => self.apu.triangle.write_to_timer_low(data),
+            0x400B => self.apu.triangle.write_to_timer_high(data),
+            0x400C => self.apu.noise.write_to_envelope(data),
+            0x400E => self.apu.noise.mode_and_period(data),
+            0x400F => self.apu.noise.write_to_length_counter(data),
+            0x4010 => {
+                self.apu.dmc.flags_and_rate(data);
+                if data & 0b1000_0000 == 0 {
+                    self.apu.status &= 0b0111_1111;
+                }
             }
+            0x4011 => self.apu.dmc.direct_load(data),
+            0x4012 => self.apu.dmc.sample_address(data),
+            0x4013 => self.apu.dmc.sample_length(data),
+            0x4015 => self.apu.write_status(data),
+            0x4017 => self.apu.write_fc(data),
+            // End of APU Calls
             0x4016 => self.joypad1.write(data),
-            0x4017 => {}
             0x8000..=0xFFFF => {
-                panic!("Attempt to write to Cartridge ROM space")
+                panic!("Attempt to write to Cartridge ROM space at {:04X} with {:02X}", addr, data)
             }
             _ => {
-                println!("Ignoring mem write-access at {:04X}", addr)
+                println!("Ignoring mem write-access at {:04X} with {:02X}", addr, data)
             }
         }
     }

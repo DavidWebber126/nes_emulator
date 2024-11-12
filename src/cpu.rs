@@ -1,6 +1,8 @@
 use crate::bus::{Bus, Mem};
 use crate::opcodes;
 
+use std::time::Instant;
+
 use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -25,11 +27,9 @@ pub struct CPU<'a> {
     pub register_a: u8,
     pub register_x: u8,
     pub register_y: u8,
-    //0bNV1B_DIZC
-    pub status: u8,
+    pub status: u8, //0bNV1B_DIZC
     pub program_counter: u16,
-    // between 0x0100 and 0x01FF. Is decremented when item added to the stack
-    pub stack_pointer: u16,
+    pub stack_pointer: u16, // between 0x0100 and 0x01FF. Is decremented when item added to the stack
     pub bus: Bus<'a>,
 }
 
@@ -95,12 +95,27 @@ impl<'a> CPU<'a> {
         self.run_with_callback(|_| {});
     }
 
+    fn interrupt_irq(&mut self) {
+        let mut flag = self.status;
+        flag &= 0b1110_1111;
+        flag |= 0b0010_0000;
+
+        //pushes stack pointer and status onto stack
+        self.stack_pointer = self.stack_pointer.wrapping_sub(3);
+        let [lo, hi] = self.program_counter.to_le_bytes();
+        self.mem_write(self.stack_pointer + 3, hi);
+        self.mem_write(self.stack_pointer + 2, lo);
+        self.mem_write(self.stack_pointer + 1, flag);
+
+        self.status |= 0b0000_0100; //disable interrupt
+
+        self.program_counter = self.mem_read_u16(0xfffe);
+    }
+
     fn interrupt_nmi(&mut self) {
         let mut flag = self.status;
         flag &= 0b1110_1111;
         flag |= 0b0010_0000;
-        // flag.set(CpuFlags::BREAK, 0);
-        // flag.set(CpuFlags::BREAK2, 1);
 
         self.stack_pointer = self.stack_pointer.wrapping_sub(3);
         let [lo, hi] = self.program_counter.to_le_bytes();
@@ -108,8 +123,7 @@ impl<'a> CPU<'a> {
         self.mem_write(self.stack_pointer + 2, lo);
         self.mem_write(self.stack_pointer + 1, flag);
 
-        self.status |= 0b0000_0100;
-        // self.status.insert(CpuFlags::INTERRUPT_DISABLE);
+        self.status |= 0b0000_0100; //disable interrupt
 
         self.bus.tick(2);
         self.program_counter = self.mem_read_u16(0xfffa);
@@ -123,6 +137,12 @@ impl<'a> CPU<'a> {
             if let Some(_nmi) = self.bus.poll_nmi_status() {
                 self.interrupt_nmi();
             }
+
+            if self.bus.poll_irq_status().is_some() && (self.status & 0b0000_0100 == 0) {
+                self.interrupt_irq();
+            }
+
+            let start = Instant::now();
 
             let opcodes: &HashMap<u8, opcodes::Opcode> = &opcodes::CPU_OP_CODES;
 
@@ -215,6 +235,10 @@ impl<'a> CPU<'a> {
 
             self.bus.tick(opcode.cycles);
             self.program_counter = self.program_counter.wrapping_add(opcode.bytes - 1);
+
+            while start.elapsed().as_nanos() < opcode.cycles as u128 * 500 {
+                // wait
+            }
         }
     }
 
@@ -280,7 +304,10 @@ impl<'a> CPU<'a> {
             }
 
             AddressingMode::Accumulator => {
-                panic!("mode {:?} is not supported", mode);
+                panic!(
+                    "mode {:?} is not supported", 
+                    mode
+                );
             }
 
             AddressingMode::NoneAddressing => {
